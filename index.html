@@ -1,164 +1,111 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Roblox Voice Chat Portal</title>
-    <style>
-        body { font-family: sans-serif; background-color: #2c3e50; color: #ecf0f1; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; background: #34495e; padding: 20px; border-radius: 8px; }
-        h1 { text-align: center; color: #1abc9c; }
-        #player-list { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); 
-            gap: 15px; 
-            margin-top: 20px;
-        }
-        .player-card { 
-            background: #2c3e50; 
-            padding: 15px; 
-            border-radius: 5px; 
-            border-left: 5px solid #e74c3c;
-        }
-        .player-card h3 { margin-top: 0; color: #f1c40f; }
-        .player-card button { 
-            background-color: #3498db; 
-            color: white; 
-            border: none; 
-            padding: 8px; 
-            cursor: pointer; 
-            border-radius: 3px; 
-            width: 100%; 
-            margin-top: 10px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Roblox Voice Chat Gateway</h1>
-        <p>Your unique code: <span id="session-code-display" style="color: #2ecc71; font-weight: bold;">(Enter Code Below)</span></p>
+// Cloudflare Worker Code: PlayerDataStore (The API Server)
 
-        <input type="text" id="code-input" placeholder="Enter your 6-digit Roblox Session Code" style="width: 100%; padding: 10px; margin-bottom: 20px;">
-        <button id="login-button">LOG IN</button>
+// 🚨 IMPORTANT: Replace the placeholder below with your actual, full .workers.dev URL.
+// This is used for a safety check and to ensure WebSockets use the right address.
+// EXAMPLE: https://roblox-voice.anthonytigerrock91011.workers.dev
+const BASE_WORKER_DOMAIN = "roblox-voice.anthonytigerrock91011.workers.dev";
 
-        <h2>Active Players (<span id="player-count">0</span>)</h2>
-        <div id="player-list">
-            </div>
-    </div>
+// The Durable Object class for stateful connections and player data storage
+export class PlayerDataStore {
+    constructor(state, env) {
+        this.state = state;
+        this.env = env;
+        this.players = {}; 
+        this.sessions = new Set(); 
+    }
 
-    <script>
-        // 🚨 REPLACE THIS PLACEHOLDER with your actual Cloudflare Worker URL
-        const BASE_WORKER_URL = "https://roblox-data-gateway.your-subdomain.workers.dev";
-        
-        // Construct the WebSocket (wss) and HTTP (https) endpoints from the base URL
-        const WS_URL = "wss://" + BASE_WORKER_URL.split('//')[1] + "/api/ws"; 
-        const API_URL = BASE_WORKER_URL + "/api/get-players";
+    async fetch(request) {
+        const url = new URL(request.url);
 
-        let localSessionCode = null;
-        let localPlayerName = null;
-        let ws = null; // WebSocket object
-
-        document.getElementById('login-button').addEventListener('click', () => {
-            const codeInput = document.getElementById('code-input').value.trim();
-            if (codeInput.length === 6 && !isNaN(codeInput)) {
-                localSessionCode = codeInput;
-                document.getElementById('session-code-display').textContent = codeInput;
-                document.getElementById('login-button').textContent = "LOGGED IN!";
-                document.getElementById('login-button').disabled = true;
+        // 1. Roblox POST Endpoint (Updates Player Data)
+        if (url.pathname === "/api/update-data" && request.method === "POST") {
+            try {
+                const playerDataList = await request.json();
+                this.players = {};
+                playerDataList.forEach(player => {
+                    this.players[player.SessionCode] = player;
+                });
                 
-                // Start connection once logged in
-                connectWebSocket(); 
-            } else {
-                alert("Please enter a valid 6-digit session code.");
+                // Notify all connected website clients of the update
+                this.broadcast({ type: "PLAYER_UPDATE", data: Object.values(this.players) });
+
+                return new Response("Data synced successfully.", { status: 200 });
+            } catch (error) {
+                return new Response("Invalid JSON data.", { status: 400 });
+            }
+        } 
+        
+        // 2. Website GET Endpoint (Initial Player Data Fetch)
+        else if (url.pathname === "/api/get-players" && request.method === "GET") {
+            return new Response(JSON.stringify(Object.values(this.players)), {
+                headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+            });
+        } 
+        
+        // 3. Website WebSocket Endpoint (Real-Time Chat Signaling)
+        else if (url.pathname === "/api/ws") {
+            const upgradeHeader = request.headers.get("Upgrade");
+            if (upgradeHeader !== "websocket") {
+                return new Response("Expected WebSocket upgrade.", { status: 426 });
+            }
+
+            const { 0: client, 1: server } = new WebSocketPair();
+            this.state.acceptWebSocket(server);
+            this.sessions.add(server);
+
+            server.addEventListener("message", event => this.webSocketMessage(server, event.data));
+            server.addEventListener("close", () => this.webSocketClose(server));
+
+            return new Response(null, { status: 101, webSocket: client });
+        }
+
+        return new Response("Worker Endpoint Not Found.", { status: 404 });
+    }
+
+    async webSocketMessage(ws, message) {
+        try {
+            const parsed = JSON.parse(message);
+            
+            if (parsed.type === "REQUEST_CHAT") {
+                // Forward the chat request to all connected clients
+                this.broadcast({
+                    type: "INCOMING_CHAT_REQUEST",
+                    senderName: parsed.senderName,
+                    senderSessionCode: parsed.senderSessionCode
+                });
+            }
+        } catch (e) {
+            console.error("WebSocket message error:", e);
+        }
+    }
+    
+    async webSocketClose(ws) {
+        this.sessions.delete(ws);
+    }
+    
+    // Broadcast message to all connected clients
+    broadcast(message) {
+        const payload = JSON.stringify(message);
+        this.sessions.forEach(session => {
+            try {
+                session.send(payload);
+            } catch (e) {
+                this.sessions.delete(session);
             }
         });
+    }
+}
 
-        // Function to establish the WebSocket connection
-        function connectWebSocket() {
-            ws = new WebSocket(WS_URL);
-
-            ws.onopen = () => {
-                console.log("WebSocket Connected!");
-                // Fetch initial list of players via the HTTP endpoint
-                fetch(API_URL).then(res => res.json()).then(players => {
-                    renderPlayerList(players);
-                });
-            };
-
-            ws.onmessage = (event) => {
-                const message = JSON.parse(event.data);
-
-                if (message.type === "PLAYER_UPDATE") {
-                    // Real-time data push from the Worker (triggered by Roblox)
-                    renderPlayerList(message.data);
-                } 
-                
-                if (message.type === "INCOMING_CHAT_REQUEST") {
-                    // Real-time chat request from another user
-                    handleIncomingChatRequest(message);
-                }
-            };
-
-            ws.onclose = () => { console.warn("WebSocket Disconnected. Attempting reconnect..."); };
-            ws.onerror = (err) => { console.error("WebSocket Error:", err); };
+// Main Worker handler (routes traffic to the data store)
+export default {
+    async fetch(request, env) {
+        // Simple security check for the worker's own domain
+        if (!request.url.includes(BASE_WORKER_DOMAIN)) {
+             return new Response("Access Denied or incorrect domain configuration.", { status: 403 });
         }
-
-        // Function to render the player list UI
-        function renderPlayerList(players) {
-            const listContainer = document.getElementById('player-list');
-            listContainer.innerHTML = ''; // Clear existing list
-
-            players.forEach(player => {
-                // Set the current user's name upon first sync
-                if (player.SessionCode === localSessionCode && !localPlayerName) {
-                    localPlayerName = player.Username;
-                }
-                
-                // Skip the currently logged-in player
-                if (player.SessionCode === localSessionCode) {
-                    return; 
-                }
-
-                const card = document.createElement('div');
-                card.className = 'player-card';
-                // Pass both the target's SessionCode (to send the message to) and Username (for the alert)
-                card.innerHTML = `
-                    <h3>${player.Username}</h3>
-                    <p>Team: ${player.Team}</p>
-                    <button onclick="requestVoiceChat('${player.SessionCode}', '${player.Username}')">Request Voice Chat</button>
-                `;
-                listContainer.appendChild(card);
-            });
-            document.getElementById('player-count').textContent = players.length;
-        }
-
-
-        // Function to handle the voice chat request (Sends a WS message)
-        function requestVoiceChat(targetCode, targetName) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                alert("Connection is not active. Please refresh.");
-                return;
-            }
-            
-            // Send a JSON message over the WebSocket to the Worker
-            ws.send(JSON.stringify({
-                type: "REQUEST_CHAT",
-                senderName: localPlayerName,
-                senderSessionCode: localSessionCode,
-                targetSessionCode: targetCode
-            }));
-
-            alert(`Request sent to ${targetName}. Waiting for them to accept...`);
-        }
-
-        // Function to handle incoming requests from the Worker
-        function handleIncomingChatRequest(message) {
-            const confirmed = confirm(`INCOMING: ${message.senderName} wants to start a voice chat! Accept?`);
-            if (confirmed) {
-                // In a real application, this is where you would initiate the WebRTC stream
-                alert(`Voice chat accepted! Now initiating WebRTC with ${message.senderName}.`);
-            } else {
-                alert("Voice chat denied.");
-            }
-        }
-    </script>
-</body>
-</html>
+        
+        const id = env.PLAYER_DATA_STORE.idFromName("global_players");
+        const stub = env.PLAYER_DATA_STORE.get(id);
+        return stub.fetch(request);
+    }
+};
